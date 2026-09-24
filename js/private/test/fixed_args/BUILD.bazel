@@ -1,5 +1,7 @@
 load("@bazel_lib//lib:testing.bzl", "assert_contains")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("//js:defs.bzl", "js_binary", "js_run_binary")
+load(":rejected_case.bzl", "rejected_case")
 load(":shell_expansion_case.bzl", "shell_expansion_case")
 
 package(default_testonly = True)
@@ -137,14 +139,78 @@ assert_contains(
     expected = "_main/x",
 )
 
+##############################################################################################
+# Tokenization. Each fixed_arg is split at analysis time and the pieces are baked into the
+# launcher quoted, so the shell expands them but does not split or glob them.
+
+write_file(
+    name = "write_a",
+    out = "split_a.txt",
+    content = [],
+)
+
+write_file(
+    name = "write_b",
+    out = "split_b.txt",
+    content = [],
+)
+
+filegroup(
+    name = "split_files",
+    srcs = [
+        "split_a.txt",
+        "split_b.txt",
+    ],
+)
+
+js_binary(
+    name = "tokenize_bin",
+    data = [":split_files"],
+    entry_point = "all_args.mjs",
+    fixed_args = [
+        # Quoted whitespace holds an argument together; unquoted whitespace splits it.
+        "\"one argument\"",
+        "two arguments",
+        # One fixed_arg expanding to several paths becomes several arguments.
+        "$(rootpaths :split_files)",
+        # A glob is passed through rather than matched against the bindir.
+        "js/private/test/fixed_args/*.txt",
+        # A double quote survives the quoting the launcher puts around each argument.
+        "'say \"hi\"'",
+    ],
+)
+
+js_run_binary(
+    name = "run_tokenize",
+    silent_on_success = False,
+    stdout = "tokenize_out",
+    tool = ":tokenize_bin",
+)
+
+[
+    assert_contains(
+        name = "tokenize_%s_test" % name,
+        actual = "tokenize_out",
+        expected = expected,
+    )
+    for (name, expected) in [
+        ("quoted_space_is_one_arg", "[one argument]"),
+        ("unquoted_space_splits_first", "[two]"),
+        ("unquoted_space_splits_second", "[arguments]"),
+        ("rootpaths_splits_first", "[js/private/test/fixed_args/split_a.txt]"),
+        ("rootpaths_splits_second", "[js/private/test/fixed_args/split_b.txt]"),
+        ("glob_is_literal", "[js/private/test/fixed_args/*.txt]"),
+        ("double_quote_survives", "[say \"hi\"]"),
+    ]
+]
+
 # ==================================================================================================
 # Shell expansion of fixed_args.
 #
-# js_binary.bzl joins fixed_args with spaces and substitutes the result into js_binary.sh.tpl
-# as raw, unquoted text. Bash therefore applies a full round of expansion to them before the
-# program ever sees them.
-#
-# The test cases below are characterization tests, not a specification.
+# js_binary.bzl splits each fixed_arg into arguments at analysis time and substitutes them into
+# js_binary.sh.tpl as one double-quoted word each, so bash expands them and does nothing else.
+# A construct that could not survive that is a build error rather than a silent mangling; those
+# cases are rejected_case rather than shell_expansion_case.
 
 # --------------------------------------------------------------------------------------------
 # Word splitting and quote removal. Bash decides where one argument ends and the next begins.
@@ -253,59 +319,56 @@ shell_expansion_case(
 )
 
 # --------------------------------------------------------------------------------------------
-# Backslash escapes. A backslash is consumed whether or not it was meant as an escape.
+# Backslashes, which are never interpreted. Quote an argument to group it instead.
 
 shell_expansion_case(
-    name = "backslash_escapes_space",
+    name = "backslash_before_space_is_literal",
     fixed_args = ["one\\ two"],
-    want_argv = ["one two"],
+    want_argv = [
+        "one\\",
+        "two",
+    ],
 )
 
 shell_expansion_case(
-    name = "backslash_before_letter_is_dropped",
+    name = "backslash_before_letter_is_kept",
     fixed_args = ["a\\b"],
-    want_argv = ["ab"],
+    want_argv = ["a\\b"],
 )
 
 shell_expansion_case(
-    name = "windows_path_loses_its_separators",
+    name = "windows_path_survives",
     fixed_args = ["C:\\Users\\foo"],
-    want_argv = ["C:Usersfoo"],
+    want_argv = ["C:\\Users\\foo"],
 )
 
 shell_expansion_case(
-    name = "backslash_escapes_glob",
+    name = "backslash_before_glob_is_literal",
     fixed_args = ["\\*.txt"],
-    want_argv = ["*.txt"],
+    want_argv = ["\\*.txt"],
 )
 
-# ANSI-C quoting, which is the only way to get a control character into an argument.
-shell_expansion_case(
+# ANSI-C quoting is inert inside the double quotes the launcher emits, so it is rejected
+# rather than silently passed through as text.
+rejected_case(
     name = "ansi_c_quoting",
     fixed_args = ["$'a\\tb'"],
-    want_argv = ["a\tb"],
+    want_error = "$' quoting is not supported in a fixed_arg",
 )
 
 # --------------------------------------------------------------------------------------------
-# Brace expansion.
+# Brace expansion, which no longer happens.
 
 shell_expansion_case(
     name = "brace_list",
     fixed_args = ["{a,b}"],
-    want_argv = [
-        "a",
-        "b",
-    ],
+    want_argv = ["{a,b}"],
 )
 
 shell_expansion_case(
     name = "brace_range",
     fixed_args = ["pre{1..3}"],
-    want_argv = [
-        "pre1",
-        "pre2",
-        "pre3",
-    ],
+    want_argv = ["pre{1..3}"],
 )
 
 shell_expansion_case(
@@ -316,7 +379,8 @@ shell_expansion_case(
 
 # --------------------------------------------------------------------------------------------
 # Parameter expansion. The launcher exports `env` before it builds the argument array, so a
-# fixed_arg can read the target's own environment.
+# fixed_arg can read the target's own environment. These survive because they hold no
+# whitespace, so tokenizing cannot split them apart; see param_expansion_with_space.
 
 shell_expansion_case(
     name = "braced_var",
@@ -337,16 +401,20 @@ shell_expansion_case(
     want_argv = ["main"],
 )
 
-# An env value is word split like anything else, so env cannot carry a value with a space
-# into a single argument either.
+# Splitting happened at analysis time, so an expanded value is never split again and env can
+# carry a value with a space into a single argument.
 shell_expansion_case(
-    name = "env_value_is_word_split",
+    name = "env_value_is_not_word_split",
     env = {"CASE_SPACEY": "a b"},
     fixed_args = ["$CASE_SPACEY"],
-    want_argv = [
-        "a",
-        "b",
-    ],
+    want_argv = ["a b"],
+)
+
+# One that would be split, and so is refused.
+rejected_case(
+    name = "param_expansion_with_space",
+    fixed_args = ["${JS_BINARY__WORKSPACE:-a b}"],
+    want_error = "whitespace inside ${...} would split a fixed_arg",
 )
 
 # env values are json.encode()d into the launcher, so an apostrophe in an env value is
@@ -369,35 +437,52 @@ shell_expansion_case(
 )
 
 # --------------------------------------------------------------------------------------------
-# Tilde expansion. HOME is pinned on the target so the result is not the developer's own.
+# Tilde expansion, which no longer happens. HOME is pinned on the target so a regression here
+# would not read as the developer's own home directory.
 
 shell_expansion_case(
     name = "tilde_alone",
     env = {"HOME": "/js_binary_test_home"},
     fixed_args = ["~"],
-    want_argv = ["/js_binary_test_home"],
+    want_argv = ["~"],
 )
 
 shell_expansion_case(
     name = "tilde_with_path",
     env = {"HOME": "/js_binary_test_home"},
     fixed_args = ["~/sub"],
-    want_argv = ["/js_binary_test_home/sub"],
+    want_argv = ["~/sub"],
 )
 
 # --------------------------------------------------------------------------------------------
-# Command substitution and arithmetic. A fixed_arg can run an arbitrary program at launch.
+# Command substitution and arithmetic. A fixed_arg can still run an arbitrary program at
+# launch, but only where the whole substitution stays inside one argument: tokenizing would
+# otherwise cut it in half and bash would reparse the pieces into a different command.
 
-shell_expansion_case(
+rejected_case(
     name = "command_substitution",
     fixed_args = ["$(echo hi)"],
+    want_error = "whitespace inside $(...) would split a fixed_arg",
+)
+
+rejected_case(
+    name = "backtick_substitution",
+    fixed_args = ["`echo tick`"],
+    want_error = "whitespace inside `...` would split a fixed_arg",
+)
+
+# Double quotes are the way to keep one: the space is no longer a token boundary.
+shell_expansion_case(
+    name = "double_quoted_command_substitution",
+    fixed_args = ["\"$(echo hi)\""],
     want_argv = ["hi"],
 )
 
+# Single quotes keep it from running at all, as they always did.
 shell_expansion_case(
-    name = "backtick_substitution",
-    fixed_args = ["`echo tick`"],
-    want_argv = ["tick"],
+    name = "single_quoted_command_substitution",
+    fixed_args = ["'$(echo hi)'"],
+    want_argv = ["$(echo hi)"],
 )
 
 shell_expansion_case(
@@ -407,32 +492,29 @@ shell_expansion_case(
 )
 
 # --------------------------------------------------------------------------------------------
-# Pathname expansion.
+# Pathname expansion, which no longer happens. The srcs put real matches at the path the
+# pattern names, so a regression would show up as an expansion rather than as a no-op.
 
 shell_expansion_case(
-    name = "glob_matches_bindir",
+    name = "glob_is_literal",
     srcs = [
         "globdir/alpha.txt",
         "globdir/beta.txt",
     ],
     fixed_args = ["js/private/test/fixed_args/globdir/*.txt"],
-    want_argv = [
-        "js/private/test/fixed_args/globdir/alpha.txt",
-        "js/private/test/fixed_args/globdir/beta.txt",
-    ],
+    want_argv = ["js/private/test/fixed_args/globdir/*.txt"],
 )
 
 shell_expansion_case(
-    name = "glob_single_character",
+    name = "glob_single_character_is_literal",
     srcs = [
         "globdir/alpha.txt",
         "globdir/beta.txt",
     ],
     fixed_args = ["js/private/test/fixed_args/globdir/alph?.txt"],
-    want_argv = ["js/private/test/fixed_args/globdir/alpha.txt"],
+    want_argv = ["js/private/test/fixed_args/globdir/alph?.txt"],
 )
 
-# nullglob is off, so a pattern that matches nothing is passed through as itself.
 shell_expansion_case(
     name = "glob_without_match_is_literal",
     srcs = [
@@ -484,75 +566,68 @@ shell_expansion_case(
 )
 
 # --------------------------------------------------------------------------------------------
-# Values that stop the launcher from running at all.
-#
-# These cases exit 0 on macOS. It ships an old version of bash (3.2), which runs the launcher's
-# EXIT trap with `$?` set to 0.
+# Shell metacharacters, which used to be spliced into the launcher as source text and so could
+# stop it from parsing. Each is now one double-quoted word and reaches the program intact.
 
 shell_expansion_case(
-    name = "apostrophe_breaks_launcher",
-    fixed_args = ["it's"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "unexpected EOF",
-)
-
-shell_expansion_case(
-    name = "double_quote_breaks_launcher",
-    fixed_args = ["a\"b"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "unexpected EOF",
-)
-
-shell_expansion_case(
-    name = "backtick_breaks_launcher",
-    fixed_args = ["a`b"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "unexpected EOF",
-)
-
-# A word starting with `#` comments out the rest of the line.
-shell_expansion_case(
-    name = "hash_breaks_launcher",
+    name = "hash_is_literal",
     fixed_args = ["#comment"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "syntax error",
+    want_argv = ["#comment"],
 )
 
 shell_expansion_case(
-    name = "semicolon_breaks_launcher",
+    name = "semicolon_is_literal",
     fixed_args = ["a;b"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "syntax error",
+    want_argv = ["a;b"],
 )
 
 shell_expansion_case(
-    name = "pipe_breaks_launcher",
+    name = "pipe_is_literal",
     fixed_args = ["a|b"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "syntax error",
+    want_argv = ["a|b"],
 )
 
 shell_expansion_case(
-    name = "redirect_breaks_launcher",
+    name = "redirect_is_literal",
     fixed_args = ["a>b"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "syntax error",
+    want_argv = ["a>b"],
 )
 
 shell_expansion_case(
-    name = "paren_breaks_launcher",
+    name = "paren_is_literal",
     fixed_args = ["a(b"],
-    macos_want_exit_code = "0",
-    want_exit_code = "2",
-    want_stderr = "syntax error",
+    want_argv = ["a(b"],
 )
+
+# --------------------------------------------------------------------------------------------
+# Values that are refused at analysis time.
+#
+# A quote that is never closed used to reach bash as unbalanced source text; it would now be
+# silently dropped instead, so it is refused.
+
+rejected_case(
+    name = "apostrophe_unterminated",
+    fixed_args = ["it's"],
+    want_error = "unterminated ' quote in a fixed_arg",
+)
+
+rejected_case(
+    name = "double_quote_unterminated",
+    fixed_args = ["a\"b"],
+    want_error = "unterminated \" quote in a fixed_arg",
+)
+
+rejected_case(
+    name = "backtick_unterminated",
+    fixed_args = ["a`b"],
+    want_error = "unterminated `...` in a fixed_arg",
+)
+
+# --------------------------------------------------------------------------------------------
+# Values that still stop the launcher from running at all.
+#
+# This case exits 0 on macOS. It ships an old version of bash (3.2), which runs the launcher's
+# EXIT trap with `$?` set to 0.
 
 # The launcher runs under `set -o nounset`, so naming a variable nothing set is fatal.
 shell_expansion_case(
@@ -561,12 +636,4 @@ shell_expansion_case(
     macos_want_exit_code = "0",
     want_exit_code = "1",
     want_stderr = "unbound variable",
-)
-
-# Under `set -o errexit`, a command substitution that fails becomes the exit code of the
-# launcher itself.
-shell_expansion_case(
-    name = "failing_command_substitution_breaks_launcher",
-    fixed_args = ["$(exit 7)"],
-    want_exit_code = "7",
 )
